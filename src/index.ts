@@ -2,8 +2,15 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import { generateInitialState, serializeState } from './engine/engine.js';
-import { PlayerInfo, Room, RoomSettings } from './types.js';
+import {
+  applyMove,
+  generateInitialState,
+  getValidMoves,
+  isGameOver,
+  getWinner,
+  serializeState
+} from './engine/engine.js';
+import { PlayerId, PlayerInfo, Room, RoomSettings } from './types.js';
 
 const app = express();
 
@@ -22,6 +29,7 @@ const io = new Server(server, {
 });
 
 const rooms = new Map<string, Room>();
+const socketToSession = new Map<string, { roomId: string; playerId: PlayerId }>();
 
 const ROOM_ID_LENGTH = 6;
 const ROOM_ID_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -67,6 +75,7 @@ io.on('connection', (socket) => {
 
     rooms.set(roomId, room);
     socket.join(roomId);
+    socketToSession.set(socket.id, { roomId, playerId: 1 });
 
     socket.emit('room:created', {
       roomId,
@@ -86,6 +95,7 @@ io.on('connection', (socket) => {
     room.players[2] = guest;
     room.lastActivityAt = Date.now();
     socket.join(roomId);
+    socketToSession.set(socket.id, { roomId, playerId: 2 });
 
     socket.emit('room:joined', {
       roomId,
@@ -143,8 +153,106 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('move:pickColor', ({ roomId, colorIndex }: { roomId: string; colorIndex: number }) => {
+    const room = rooms.get(roomId);
+
+    if (!room) {
+      socket.emit('error', { code: 'ROOM_NOT_FOUND', message: 'Room not found' });
+      return;
+    }
+
+    if (room.status !== 'playing') {
+      socket.emit('error', { code: 'ROOM_NOT_PLAYING', message: 'Room is not playing' });
+      return;
+    }
+
+    if (!room.state) {
+      socket.emit('error', { code: 'ROOM_NOT_PLAYING', message: 'Room is not playing' });
+      return;
+    }
+
+    const session = socketToSession.get(socket.id);
+    if (!session || session.roomId !== roomId) {
+      socket.emit('error', { code: 'NOT_IN_ROOM', message: 'Not part of the room' });
+      return;
+    }
+
+    const playerId = session.playerId;
+
+    if (playerId !== room.state.currentPlayer) {
+      socket.emit('error', { code: 'NOT_YOUR_TURN', message: 'Not your turn' });
+      return;
+    }
+
+    const validMoves = getValidMoves(room.state, playerId);
+    if (!validMoves[colorIndex]) {
+      socket.emit('error', { code: 'INVALID_MOVE', message: 'Invalid move' });
+      return;
+    }
+
+    room.state = applyMove(room.state, playerId, colorIndex);
+    room.lastActivityAt = Date.now();
+
+    io.to(roomId).emit('game:state', {
+      roomId,
+      state: room.state ? serializeState(room.state) : null
+    });
+
+    if (room.state && isGameOver(room.state)) {
+      room.status = 'finished';
+      const result = getWinner(room.state);
+      io.to(roomId).emit('game:over', { roomId, result });
+      io.to(roomId).emit('room:update', {
+        roomId,
+        status: room.status,
+        players: sanitizePlayers(room.players)
+      });
+    }
+  });
+
   socket.on('disconnect', () => {
     console.log('socket disconnected', socket.id);
+    const session = socketToSession.get(socket.id);
+    if (!session) return;
+
+    const { roomId, playerId } = session;
+    const room = rooms.get(roomId);
+
+    socketToSession.delete(socket.id);
+
+    if (!room) return;
+
+    if (room.status === 'playing') {
+      const otherPlayerId: PlayerId = playerId === 1 ? 2 : 1;
+      if (room.state) {
+        const result = {
+          winner: otherPlayerId,
+          score1: room.state.score[1],
+          score2: room.state.score[2]
+        };
+        room.status = 'finished';
+        room.lastActivityAt = Date.now();
+        if (room.players[playerId]) {
+          room.players[playerId] = { name: room.players[playerId]!.name, socketId: '' };
+        }
+        io.to(roomId).emit('game:over', { roomId, result });
+        io.to(roomId).emit('room:update', {
+          roomId,
+          status: room.status,
+          players: sanitizePlayers(room.players)
+        });
+      }
+    } else if (room.status === 'lobby') {
+      if (room.players[playerId]) {
+        delete room.players[playerId];
+      }
+      room.lastActivityAt = Date.now();
+      io.to(roomId).emit('room:update', {
+        roomId,
+        status: room.status,
+        players: sanitizePlayers(room.players)
+      });
+    }
   });
 });
 
