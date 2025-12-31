@@ -1,4 +1,6 @@
-export type PlayerId = 1 | 2;
+import type { GameState, PlayerId as EnginePlayerId } from './engine/types.js';
+
+export type PlayerId = EnginePlayerId;
 
 export type GameMode = 'online';
 
@@ -20,4 +22,6 @@ export interface Room {
   settings: RoomSettings;
   players: { 1?: PlayerInfo; 2?: PlayerInfo };
   hostPlayerId: PlayerId;
+  state?: GameState;
+  lastActivityAt?: number;
 }

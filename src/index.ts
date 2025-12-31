@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import { generateInitialState, serializeState } from './engine/engine.js';
 import { PlayerInfo, Room, RoomSettings } from './types.js';
 
 const app = express();
@@ -37,6 +38,16 @@ const generateRoomId = (): string => {
   return roomId;
 };
 
+const sanitizePlayer = (player?: PlayerInfo) => {
+  if (!player) return undefined;
+  return { name: player.name };
+};
+
+const sanitizePlayers = (players: Room['players']) => ({
+  1: sanitizePlayer(players[1]),
+  2: sanitizePlayer(players[2])
+});
+
 io.on('connection', (socket) => {
   console.log('socket connected', socket.id);
 
@@ -50,7 +61,8 @@ io.on('connection', (socket) => {
       createdAt: Date.now(),
       settings,
       players: { 1: host },
-      hostPlayerId: 1
+      hostPlayerId: 1,
+      lastActivityAt: Date.now()
     };
 
     rooms.set(roomId, room);
@@ -59,7 +71,7 @@ io.on('connection', (socket) => {
     socket.emit('room:created', {
       roomId,
       assignedPlayerId: 1 as const,
-      players: room.players
+      players: sanitizePlayers(room.players)
     });
   });
 
@@ -72,18 +84,62 @@ io.on('connection', (socket) => {
 
     const guest: PlayerInfo = { name, socketId: socket.id };
     room.players[2] = guest;
+    room.lastActivityAt = Date.now();
     socket.join(roomId);
 
     socket.emit('room:joined', {
       roomId,
       assignedPlayerId: 2 as const,
-      players: room.players
+      players: sanitizePlayers(room.players)
     });
 
     io.to(roomId).emit('room:update', {
       roomId,
       status: room.status,
-      players: room.players
+      players: sanitizePlayers(room.players)
+    });
+  });
+
+  socket.on('room:start', ({ roomId }: { roomId: string }) => {
+    const room = rooms.get(roomId);
+
+    if (!room) {
+      socket.emit('error', { code: 'ROOM_NOT_FOUND', message: 'Room not found' });
+      return;
+    }
+
+    if (room.status !== 'lobby') {
+      socket.emit('error', { code: 'ROOM_NOT_IN_LOBBY', message: 'Room is not in lobby' });
+      return;
+    }
+
+    if (!room.players[1] || !room.players[2]) {
+      socket.emit('error', { code: 'ROOM_NOT_READY', message: 'Room is missing players' });
+      return;
+    }
+
+    if (room.players[1].socketId !== socket.id) {
+      socket.emit('error', { code: 'NOT_HOST', message: 'Only host can start the game' });
+      return;
+    }
+
+    room.state = generateInitialState({
+      cols: room.settings.cols,
+      rows: room.settings.rows,
+      paletteSize: room.settings.paletteSize
+    });
+    room.status = 'playing';
+    room.lastActivityAt = Date.now();
+
+    io.to(roomId).emit('room:update', {
+      roomId,
+      status: room.status,
+      players: sanitizePlayers(room.players)
+    });
+
+    io.to(roomId).emit('game:state', {
+      roomId,
+      state: room.state ? serializeState(room.state) : null
     });
   });
 
